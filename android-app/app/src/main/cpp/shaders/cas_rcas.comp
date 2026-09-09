@@ -57,7 +57,7 @@ void main() {
     // source pixel, avoiding a second full-screen pass.
     if (pc.outputSize.x > pc.inputSize.x || pc.outputSize.y > pc.inputSize.y) {
         vec2 uv = (vec2(outPx) + 0.5) / pc.outputSize;
-        result = mix(result, texture(uInput, uv).rgb, 0.22);
+        result = mix(result, textureLod(uInput, uv, 0.0).rgb, 0.22);
     }
 
     imageStore(uOutput, outPx, vec4(clamp(result, 0.0, 1.0), e == e ? 1.0 : 1.0));
