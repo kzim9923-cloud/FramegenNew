@@ -247,44 +247,6 @@ object NativeBridge {
     external fun getDynamicBypassCount(): Long
 
     /**
-     * Enables/disables the REAL-FRAME-FIRST auto-bypass (skip generation for
-     * the current frame when a newer real capture is already queued). OFF by
-     * default: the user must turn this on from Settings.
-     */
-    external fun setRealFrameFirstEnabled(enabled: Boolean)
-
-    /**
-     * Enables/disables the generation-preflight safety-window check (rejects a
-     * generation whose projected cost would already eat too much of the
-     * source capture interval). OFF by default. [setPreflightSafetyWindowRatio]
-     * tunes the fraction once enabled.
-     */
-    external fun setPreflightSafetyWindowEnabled(enabled: Boolean)
-
-    /** Fraction of the capture interval a projected generation may consume before rejection; clamped natively to [0.1, 1.0]. */
-    external fun setPreflightSafetyWindowRatio(ratio: Double)
-
-    /**
-     * Enables/disables genWorker's "dropping stale generated outputs" logcat
-     * line, which fires on every epoch-invalidated generation (bypass
-     * toggles, resizes, resolution changes can trigger many in a row). OFF
-     * by default: the user must turn this on from Settings to diagnose it.
-     */
-    external fun setStaleDropLoggingEnabled(enabled: Boolean)
-
-    /**
-     * Enables/disables the REAL->GEN ordering guard's tolerance mode: OFF by
-     * default reproduces the original strict jobEpoch==currentEpoch
-     * behaviour (any epoch drift is dropped). When enabled, a generation can
-     * still be published up to [setStaleGenerationToleranceEpochs] epochs
-     * behind the current epoch instead of always being dropped.
-     */
-    external fun setStaleGenerationToleranceEnabled(enabled: Boolean)
-
-    /** How many epochs behind current a generation may be and still publish; clamped natively to [0, 10]. */
-    external fun setStaleGenerationToleranceEpochs(epochs: Int)
-
-    /**
      * How many REAL captures may sit queued behind the one currently being
      * processed before the oldest are evicted. Clamped natively to [1, 8]; 1
      * reproduces the original "queue bounded to one waiting frame" behaviour.
