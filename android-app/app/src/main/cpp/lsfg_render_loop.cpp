@@ -109,10 +109,6 @@ struct State {
     // framegen's frameIdx parity never flipped and the *other* slot is about
     // to go stale relative to the new capture. -1 = none yet.
     int lastCaptureSlot = -1;
-    // Last REAL capture frame-id that was actually submitted to the output.
-    // Keep REAL presentation monotonic so a late capture cannot overtake a
-    // newer frame and break the REAL -> GEN* -> REAL sequence.
-    uint64_t lastPostedRealFrameId = 0;
 
     // Vulkan swapchain state. When live, blitOutputToWindow takes the
     // GPU-only fast path: vkAcquireNextImageKHR → vkCmdBlitImage from the
@@ -199,12 +195,14 @@ struct State {
     IfrnetInterpolator *aiIfrnet = nullptr;
 #endif
     std::atomic<bool> bypass{false}; // skip framegen, blit raw input
+    std::atomic<int32_t> frameSchedulingMode{0}; // 0=no-wait, 1=wait
     // Auto-bypass triggered when framegen returns VK_ERROR_DEVICE_LOST during
     // presentContext. Distinct from the user-controlled `bypass` so the user
     // toggle isn't silently flipped by a recoverable driver event. Cleared on
     // every initRenderLoop / context recreation — if the next session
     // succeeds, framegen runs again. Stuck-on means the next presentContext
     // would error too, so passthrough is the right behaviour anyway.
+    std::atomic<bool> framegenAutoDisabled{false};
     std::atomic<uint64_t> cacheHits{0};
     std::atomic<uint64_t> cacheMisses{0};
     std::vector<AhbImage> outputs; // multiplier-many outputs
@@ -257,8 +255,8 @@ struct State {
 
 
 
-    // Ordered capture queue. manual non-blocking is lossless and retains every
-    // capture until its turn is processed; manual non-blocking may use the configurable
+    // Ordered capture queue. WAIT_GENERATION is lossless and retains every
+    // capture until its turn is processed; NO_WAIT may use the configurable
     // bounded queue policy. The worker owns the frame it has popped.
     struct PendingFrame {
         AHardwareBuffer *ahb = nullptr;
@@ -270,7 +268,7 @@ struct State {
     // Monotonically increasing capture epoch. Framegen jobs are invalidated when newer real frames arrive.
     std::atomic<uint64_t> latestFrameId{0};
     // Forces the next processed REAL frame to become a fresh pairing anchor.
-    // Set on manual bypass so no frame from before the discontinuity can
+    // Set on manual/dynamic bypass so no frame from before the discontinuity can
     // ever be used as an interpolation predecessor after FrameGen resumes.
     std::atomic<bool> pairingResetPending{false};
     // Submitted FrameGen may still be reading both input images. Never overwrite
@@ -360,7 +358,7 @@ struct State {
 
     // --- Legacy pacing telemetry ----------------------------------------------
     // Kept for settings/HUD compatibility. It no longer controls generation
-    // admission is controlled by the manual pacing and queue settings.
+    // admission; WAIT_GENERATION must remain lossless.
     std::atomic<int64_t> emaGenerationNs{0};
     std::atomic<int64_t> emaCaptureIntervalNs{0};
     // User-tunable pacing/statistics parameters. These are hot-applied by
@@ -368,9 +366,28 @@ struct State {
     std::atomic<float> pacingEmaAlpha{0.125f};
     std::atomic<float> pacingOutlierRatio{4.0f};
     std::atomic<int64_t> lastProcessedCaptureTimestampNs{0};
+    std::atomic<uint64_t> dynamicBypassCount{0};
+    // Both automatic bypass policies below are OFF by default: generation is
+    // never silently skipped for backlog pressure or for a queued newer real
+    // frame until the user explicitly turns each one on (and can tune it)
+    // from Settings. Set via setDynamicBypassEnabled.
+    std::atomic<bool> dynamicBypassEnabled{false};
+    // Multiplies captureIntervalNs to form the queued-work latency budget
+    // dynamicBypass compares against. User-tunable via
+    // setDynamicBypassBudgetMultiplier(); clamped to [1.0, 5.0].
+    std::atomic<double> dynamicBypassBudgetMultiplier{1.5};
     // Bounds how many REAL captures may sit queued behind the one currently
-    // being processed before pushFrame() evicts the oldest ones. User-tunable [1, 8].
+    // being processed before pushFrame() evicts the oldest ones. 1 reproduces
+    // the original "queue bounded to one waiting frame" behaviour. User-tunable
+    // via setMaxQueuedRealFrames(); clamped to [1, 8].
     std::atomic<int> maxQueuedRealFrames{1};
+    // Whether a VK_ERROR_DEVICE_LOST during presentContext is allowed to
+    // auto-disable framegen for the rest of the session (passthrough until
+    // the next context reinit). ON by default — this is a crash-recovery
+    // safety net, not a load-balancing policy, but user-tunable via
+    // setAutoDisableOnDeviceLostEnabled() for anyone who'd rather keep
+    // retrying framegen after a device-lost event.
+    std::atomic<bool> autoDisableOnDeviceLostEnabled{true};
 
     // --- Resolution-aware generation cost model ---------------------------
     // emaGenerationNs above is a flat, resolution-blind absolute-time EMA.
@@ -416,9 +433,25 @@ ShizukuTimingSample loadShizukuTimingSample() {
 // fall back to defaults so partial updates from JNI can't accidentally
 // disable the pacer.
 void handleFramegenException(const char *callSite, const std::exception &e) {
-    // Errors are reported to the caller/log only. Framegen is never
-    // automatically disabled; recovery is entirely manual.
-    LOGE("%s threw: %s", callSite, e.what() ? e.what() : "(null)");
+    const char *what = e.what() != nullptr ? e.what() : "(null)";
+    LOGE("%s threw: %s", callSite, what);
+    const bool isDeviceLost = std::strstr(what, "error -4") != nullptr ||
+                              std::strstr(what, "DEVICE_LOST")  != nullptr;
+    if (!isDeviceLost) return;
+    // User-tunable via setAutoDisableOnDeviceLostEnabled(); ON by default
+    // (crash-recovery safety net, not a load-balancing policy). When
+    // disabled, framegen is allowed to keep retrying on subsequent frames
+    // instead of latching into passthrough for the rest of the session.
+    if (!g.autoDisableOnDeviceLostEnabled.load(std::memory_order_relaxed)) {
+        LOGE("%s: VK_ERROR_DEVICE_LOST — auto-disable is turned off by user setting, framegen will keep retrying",
+             callSite);
+        return;
+    }
+    if (!g.framegenAutoDisabled.load(std::memory_order_relaxed)) {
+        LOGE("%s: VK_ERROR_DEVICE_LOST — auto-disabling framegen for this session (passthrough until next context reinit)",
+             callSite);
+        g.framegenAutoDisabled.store(true, std::memory_order_relaxed);
+    }
 }
 
 float clamp01(float value) {
@@ -988,7 +1021,7 @@ bool blitOutputToSwapchain(const AhbImage &src, VkSemaphore framegenDoneSemaphor
 
     uint32_t imageIdx = 0;
     // Adaptive acquire: do not use a zero-timeout path that silently discards
-    // frames when the presentation queue is temporarily busy.
+    // frames when the presentation queue is temporarily busy. Dynamic bypass
     // handles GPU load; the WSI stage must not become a hidden FPS limiter.
     //
     // Timeout is derived from the actual recent combined post cadence
@@ -1827,6 +1860,10 @@ void genWorkerThread() {
             g.genReady.store(true, std::memory_order_release);
         }
 
+        // Feed the same admission-control cost model the main thread uses, so
+        // dynamicBypass still reacts to how long generation is actually
+        // taking on this device (and at what resolution) — it just no
+        // longer has to sit on the hot path to measure it.
         const int64_t generationNs = std::chrono::duration_cast<
             std::chrono::nanoseconds>(State::Clock::now() - startedAt).count();
         recordGenerationCostSample(generationNs, jobPixelCount);
@@ -1922,6 +1959,23 @@ void workerThread() {
         AHardwareBuffer *ahb = pendingFrame.ahb;
         if (ahb == nullptr) continue;
         const uint64_t jobFrameId = pendingFrame.frameId;
+
+        // WAIT mode is the only place that waits: the next REAL frame is not
+        // allowed to reach the display until the previous pair's generation
+        // has completed. NO-WAIT never blocks; late generation is discarded.
+        if (g.frameSchedulingMode.load(std::memory_order_relaxed) == 1 &&
+            g.cpuFallbackGenInFlight.load(std::memory_order_acquire)) {
+            std::unique_lock<std::mutex> genLock(g.genMu);
+            g.genDoneCv.wait(genLock, [] {
+                return g.genStopRequested ||
+                       !g.cpuFallbackGenInFlight.load(std::memory_order_acquire);
+            });
+            if (g.stopRequested) {
+                AHardwareBuffer_release(ahb);
+                return;
+            }
+        }
+
         reapFramegenCompletionTickets();
         if (g.framegenCompletionTickets.empty() &&
             !g.cpuFallbackGenInFlight.load(std::memory_order_acquire)) {
@@ -1933,6 +1987,7 @@ void workerThread() {
         const uint64_t readyEpoch = g.genReadyFrameId.load(std::memory_order_acquire);
         if (g.genReady.exchange(false, std::memory_order_acq_rel) && readyEpoch != 0) {
             const bool canPublish =
+                g.frameSchedulingMode.load(std::memory_order_relaxed) == 1 ||
                 readyEpoch == (pendingFrame.frameId > 0 ? pendingFrame.frameId - 1 : 0);
             if (canPublish && !g.bypass.load(std::memory_order_relaxed)) {
                 int posted = 0;
@@ -2013,7 +2068,7 @@ void workerThread() {
         } else if (!framegenInputsBusy) {
             // If the previous capture targeted this SAME physical slot,
             // g.presentsDone did not advance since then — i.e. the previous
-            // capture's generation was bypassed (manual bypass or backlog,
+            // capture's generation was bypassed (dynamic bypass, backlog,
             // cpuFallbackGenInFlight, ...) and framegen's internal frameIdx
             // parity never flipped, so newSlot repeats. Left alone,
             // inSlot[oldSlot] still holds whatever was captured before that
@@ -2062,23 +2117,10 @@ void workerThread() {
         // Keep the current REAL pending until this pair's generated outputs
         // have been published (or generation is skipped/invalidated).
         auto postCurrentReal = [&]() -> bool {
-            // REAL frames are the hard ordering anchors. Never allow a late
-            // capture to overtake one that has already reached the output.
-            // frameId==0 remains compatible with legacy callers.
-            if (pendingFrame.frameId != 0 &&
-                pendingFrame.frameId <= g.lastPostedRealFrameId) {
-                LOGW("workerThread: suppress out-of-order REAL frameId=%llu lastPosted=%llu",
-                     static_cast<unsigned long long>(pendingFrame.frameId),
-                     static_cast<unsigned long long>(g.lastPostedRealFrameId));
-                return false;
-            }
-
             const bool posted = framegenInputsBusy
                 ? blitOutputToWindow(src)
                 : blitOutputToWindow(g.inSlot[newSlot]);
             if (posted) {
-                if (pendingFrame.frameId != 0)
-                    g.lastPostedRealFrameId = pendingFrame.frameId;
                 const uint64_t postTimeNs = std::chrono::duration_cast<
                     std::chrono::nanoseconds>(
                     State::Clock::now().time_since_epoch()).count();
@@ -2093,20 +2135,29 @@ void workerThread() {
 
         // AI backend takes priority over the LSFG shader path when it's
         // loaded and active — they're mutually exclusive per session
-        // (initRenderLoop only stands up one or the other; see below).        // Generation admission is controlled directly by the manual pacing
-        // parameters and bounded queue. Never block the real-frame path waiting
-        // for a generated frame.
+        // (initRenderLoop only stands up one or the other; see below).
+        // Generation admission is deliberately single-purpose:
+        //   WAIT_GENERATION = lossless; every valid REAL pair is generated.
+        //   NO_WAIT         = may skip a pair while another generation is busy.
+        //
+        // The previous pixel-cost/queue-pressure controller duplicated the
+        // scheduler and could silently bypass frames. WAIT mode must be a hard
+        // ordering contract, not a best-effort latency heuristic.
+        const bool waitGeneration =
+            g.frameSchedulingMode.load(std::memory_order_relaxed) == 1;
+
         const bool generationAllowed =
             (jobFrameId != 0) &&
             !firstRealFrame &&
             !g.bypass.load(std::memory_order_relaxed) &&
             !pairingResetThisFrame &&
-            !framegenInputsBusy;
+            (!framegenInputsBusy || waitGeneration);
 
         const bool runAi = g.aiLoaded && generationAllowed;
         const bool runFramegen = !runAi
                                  && g.framegenCtxId >= 0
-                                 && generationAllowed;
+                                 && generationAllowed
+                                 && !g.framegenAutoDisabled.load(std::memory_order_relaxed);
 
         const uint64_t currentPixelCount =
             static_cast<uint64_t>(g.inSlot[newSlot].extent.width) *
@@ -2225,11 +2276,68 @@ void workerThread() {
                 }
                 g.genCv.notify_one();
 
-                // No exportable completion path means we cannot publish GEN
-                // without waiting for waitIdle() first — so we don't make
-                // REAL wait for it. genWorkerThread runs that wait (and the
-                // generated-output blit, gated by generationStillValid) off
-                // this hot path instead.
+                // STRICT PAIR ORDER:
+                //   REAL(previous) -> GEN(previous,current) -> REAL(current)
+                //
+                // The previous asynchronous hand-off posted REAL(current)
+                // immediately and let genWorkerThread publish GEN later. That
+                // is inherently able to produce:
+                //   REAL(previous) -> REAL(current) -> GEN(previous,current)
+                // or, when another capture arrived, GEN from an older pair
+                // after a newer REAL. Once generation is part of the visible
+                // frame sequence, completion is therefore a presentation
+                // dependency, not merely background work.
+                //
+                // Keep capture ingestion queued, but do NOT expose the current
+                // REAL until this pair's generation has completed and its
+                // generated frames have been posted. This is the only ordering
+                // that is deterministic on devices where LSFG completion can
+                // only be observed through waitIdle().
+                {
+                    std::unique_lock<std::mutex> genLock(g.genMu);
+                    g.genDoneCv.wait(genLock, [&] {
+                        return g.genStopRequested ||
+                               !g.cpuFallbackGenInFlight.load(std::memory_order_acquire);
+                    });
+                }
+
+                if (g.stopRequested) {
+                    AHardwareBuffer_release(ahb);
+                    return;
+                }
+
+                // Consume ONLY the generation belonging to this REAL pair.
+                // A generation for any other epoch must never be inserted into
+                // this pair's sequence.
+                const uint64_t readyForPair =
+                    g.genReadyFrameId.load(std::memory_order_acquire);
+                const bool readyForThisPair =
+                    readyForPair == jobFrameId &&
+                    g.genReady.exchange(false, std::memory_order_acq_rel);
+
+                if (readyForThisPair && !g.bypass.load(std::memory_order_relaxed)) {
+                    int postedGenerated = 0;
+                    for (const auto &out : g.outputs) {
+                        if (blitOutputToWindow(out)) ++postedGenerated;
+                    }
+                    if (postedGenerated > 0) {
+                        g.generatedFrames.fetch_add(
+                            static_cast<uint64_t>(postedGenerated),
+                            std::memory_order_relaxed);
+                    }
+                } else {
+                    // waitIdle() completed but the session changed while it
+                    // was running (bypass/stop/re-anchor). Never publish stale
+                    // generated pixels. The current REAL remains the safe
+                    // boundary for the visible sequence.
+                    g.genReady.store(false, std::memory_order_release);
+                    LOGI("workerThread: generation not published for frameId=%llu ready=%llu",
+                         static_cast<unsigned long long>(jobFrameId),
+                         static_cast<unsigned long long>(readyForPair));
+                }
+
+                // The generated segment is now fully consumed, so REAL(current)
+                // is the final boundary of this pair.
                 postCurrentReal();
                 continue;
             }
@@ -2482,15 +2590,20 @@ int initRenderLoop(const char *cacheDir, const RenderLoopConfig &cfg) {
     g.presentsDone = 0;
     g.latestFrameId.store(0, std::memory_order_relaxed);
     g.lastCaptureSlot = -1;
-    g.lastPostedRealFrameId = 0;
     g.pairingResetPending.store(false, std::memory_order_relaxed);
     g.emaGenerationNs.store(0, std::memory_order_relaxed);
     g.emaGenNsPerMegapixel.store(0, std::memory_order_relaxed);
     g.emaCaptureIntervalNs.store(0, std::memory_order_relaxed);
     g.lastProcessedCaptureTimestampNs.store(0, std::memory_order_relaxed);
+    g.dynamicBypassCount.store(0, std::memory_order_relaxed);
     // Don't reset g.bypass — the user toggle should persist across re-inits
     // (e.g. when they change multiplier while bypass is on, the new context
     // should also start in bypass).
+    // DO reset the framegen auto-disable latch — that flag tracks a driver
+    // error tied to the previous device handle, which is being recreated here.
+    // Carrying it forward would silently keep framegen off forever after one
+    // bad submit, even on a healthy new device.
+    g.framegenAutoDisabled.store(false, std::memory_order_relaxed);
 
     int rc = create_session(g.vk);
     if (rc != kOk) {
@@ -2605,6 +2718,12 @@ int initRenderLoop(const char *cacheDir, const RenderLoopConfig &cfg) {
     // If not, Kotlin will keep the overlay up in mirror mode instead of
     // routing the capture through a dead context.
     return (g.framegenCtxId >= 0 || g.aiLoaded) ? kOk : kRenderLoopFramegenDisabled;
+}
+
+void setFrameSchedulingMode(int32_t mode) {
+    const int32_t normalized = mode == 1 ? 1 : 0;
+    g.frameSchedulingMode.store(normalized, std::memory_order_relaxed);
+    LOGI("Frame scheduling mode: %s", normalized == 1 ? "WAIT_GENERATION" : "NO_WAIT");
 }
 
 void setOutputSurface(ANativeWindow *win, uint32_t w, uint32_t h) {
@@ -2725,12 +2844,16 @@ void pushFrame(AHardwareBuffer *ahb, int64_t timestampNs, uint64_t frameId) {
             .captureTimestampNs = timestampNs,
             .frameId = frameId,
         });
-        // Queue depth is always controlled directly by the manual setting.
+        // WAIT_GENERATION is lossless: every captured REAL frame stays in the
+        // queue until its pair has been processed. NO_WAIT retains the bounded
+        // queue policy because that mode explicitly permits late work to skip.
+        if (g.frameSchedulingMode.load(std::memory_order_relaxed) != 1) {
             const size_t maxQueued = static_cast<size_t>(std::max(
                 1, g.maxQueuedRealFrames.load(std::memory_order_relaxed)));
             while (g.pendingFrames.size() > maxQueued) {
                 AHardwareBuffer_release(g.pendingFrames.front().ahb);
                 g.pendingFrames.pop_front();
+            }
         }
     }
     g.pendingCv.notify_one();
@@ -2842,7 +2965,8 @@ void shutdownRenderLoop() {
         g.emaGenNsPerMegapixel.store(0, std::memory_order_relaxed);
         g.emaCaptureIntervalNs.store(0, std::memory_order_relaxed);
         g.lastProcessedCaptureTimestampNs.store(0, std::memory_order_relaxed);
-            g.pairingResetPending.store(false, std::memory_order_relaxed);
+        g.dynamicBypassCount.store(0, std::memory_order_relaxed);
+        g.pairingResetPending.store(false, std::memory_order_relaxed);
     }
     LOGI("Render loop shut down");
 }
@@ -2972,6 +3096,34 @@ void setBypass(bool bypass) {
          g.pairingResetPending.load(std::memory_order_relaxed) ? 1 : 0);
 }
 
+// User control for the backlog-pressure auto-bypass (see g.dynamicBypassEnabled
+// at its declaration). OFF by default — must be explicitly enabled from
+// Settings. Toggling this does not by itself invalidate pairing; the next
+// generation decision simply starts consulting (or ignoring) the policy.
+void setDynamicBypassEnabled(bool enabled) {
+    g.dynamicBypassEnabled.store(enabled, std::memory_order_relaxed);
+    LOGI("Dynamic (backlog-pressure) auto-bypass: %s", enabled ? "enabled" : "disabled");
+}
+
+// User-tunable multiplier applied to the source capture interval to form the
+// queued-work latency budget dynamicBypass compares against. Clamped to
+// [1.0, 5.0]: below 1.0 the budget would be tighter than a single frame
+// interval (bypasses almost every frame once any work is queued), above 5.0
+// the budget is loose enough to rarely trigger and the setting stops doing
+// anything useful.
+void setDynamicBypassBudgetMultiplier(double multiplier) {
+    const double clamped = std::clamp(multiplier, 1.0, 5.0);
+    g.dynamicBypassBudgetMultiplier.store(clamped, std::memory_order_relaxed);
+    LOGI("Dynamic bypass budget multiplier set to %.2f", clamped);
+}
+
+// Diagnostic counter for the UI: how many times dynamicBypass has actually
+// engaged since init. Useful to show the user whether the feature (once they
+// enable it) is doing anything on their device.
+uint64_t getDynamicBypassCount() {
+    return g.dynamicBypassCount.load(std::memory_order_relaxed);
+}
+
 // How many REAL captures may sit queued behind the one currently being
 // processed before pushFrame() evicts the oldest ones. 1 reproduces the
 // original "queue bounded to one waiting frame" behaviour. Clamped to [1, 8]:
@@ -2981,6 +3133,26 @@ void setMaxQueuedRealFrames(int depth) {
     const int clamped = std::clamp(depth, 1, 8);
     g.maxQueuedRealFrames.store(clamped, std::memory_order_relaxed);
     LOGI("Max queued real frames set to %d", clamped);
+}
+
+// Whether a VK_ERROR_DEVICE_LOST during presentContext is allowed to
+// auto-disable framegen for the rest of the session. ON by default; turning
+// this off lets framegen keep retrying on subsequent frames instead of
+// latching into permanent passthrough, at the risk of repeated driver errors.
+void setAutoDisableOnDeviceLostEnabled(bool enabled) {
+    g.autoDisableOnDeviceLostEnabled.store(enabled, std::memory_order_relaxed);
+    LOGI("Auto-disable on device-lost: %s", enabled ? "enabled" : "disabled");
+}
+
+// Manually clears a latched device-lost auto-disable without requiring a
+// full context reinit. No-op (returns false) if framegen wasn't auto-disabled.
+bool resumeFramegenAfterAutoDisable() {
+    const bool wasDisabled = g.framegenAutoDisabled.exchange(false, std::memory_order_acq_rel);
+    if (wasDisabled) {
+        g.pairingResetPending.store(true, std::memory_order_release);
+        LOGI("Framegen resumed manually after device-lost auto-disable");
+    }
+    return wasDisabled;
 }
 
 void setPacingParams(float emaAlpha, float outlierRatio) {
