@@ -2276,46 +2276,36 @@ void workerThread() {
                 }
                 g.genCv.notify_one();
 
-                // STRICT PAIR ORDER:
+                // STRICT PRESENT ORDER:
+                // The pair represented by this iteration is:
                 //   REAL(previous) -> GEN(previous,current) -> REAL(current)
                 //
-                // The previous asynchronous hand-off posted REAL(current)
-                // immediately and let genWorkerThread publish GEN later. That
-                // is inherently able to produce:
-                //   REAL(previous) -> REAL(current) -> GEN(previous,current)
-                // or, when another capture arrived, GEN from an older pair
-                // after a newer REAL. Once generation is part of the visible
-                // frame sequence, completion is therefore a presentation
-                // dependency, not merely background work.
+                // The generation itself may wait on genWaitThread, but the
+                // CURRENT real frame must NOT be posted until that generation
+                // has completed. Otherwise the asynchronous fallback produces
+                // the exact bad sequence we are trying to prevent:
+                //   REAL(previous) -> REAL(current) -> GEN(previous,current).
                 //
-                // Keep capture ingestion queued, but do NOT expose the current
-                // REAL until this pair's generation has completed and its
-                // generated frames have been posted. This is the only ordering
-                // that is deterministic on devices where LSFG completion can
-                // only be observed through waitIdle().
+                // Capture ingestion remains asynchronous (new captures can
+                // accumulate in pendingFrames), but presentation is serialized
+                // at this point so GEN can never overtake its right-hand REAL.
                 {
                     std::unique_lock<std::mutex> genLock(g.genMu);
                     g.genDoneCv.wait(genLock, [&] {
                         return g.genStopRequested ||
+                               g.genCompletedFrameId >= pendingFrame.frameId ||
                                !g.cpuFallbackGenInFlight.load(std::memory_order_acquire);
                     });
                 }
 
-                if (g.stopRequested) {
-                    AHardwareBuffer_release(ahb);
-                    return;
-                }
+                const bool generationCompleted =
+                    g.genCompletedFrameId >= pendingFrame.frameId &&
+                    !g.bypass.load(std::memory_order_relaxed) &&
+                    !g.stopRequested;
 
-                // Consume ONLY the generation belonging to this REAL pair.
-                // A generation for any other epoch must never be inserted into
-                // this pair's sequence.
-                const uint64_t readyForPair =
-                    g.genReadyFrameId.load(std::memory_order_acquire);
-                const bool readyForThisPair =
-                    readyForPair == jobFrameId &&
-                    g.genReady.exchange(false, std::memory_order_acq_rel);
-
-                if (readyForThisPair && !g.bypass.load(std::memory_order_relaxed)) {
+                if (generationCompleted &&
+                    g.genReady.exchange(false, std::memory_order_acq_rel) &&
+                    g.genReadyFrameId.load(std::memory_order_acquire) == pendingFrame.frameId) {
                     int postedGenerated = 0;
                     for (const auto &out : g.outputs) {
                         if (blitOutputToWindow(out)) ++postedGenerated;
@@ -2326,18 +2316,13 @@ void workerThread() {
                             std::memory_order_relaxed);
                     }
                 } else {
-                    // waitIdle() completed but the session changed while it
-                    // was running (bypass/stop/re-anchor). Never publish stale
-                    // generated pixels. The current REAL remains the safe
-                    // boundary for the visible sequence.
+                    // Generation failed/cancelled. REAL still advances the
+                    // presentation sequence; never display a stale GEN.
                     g.genReady.store(false, std::memory_order_release);
-                    LOGI("workerThread: generation not published for frameId=%llu ready=%llu",
-                         static_cast<unsigned long long>(jobFrameId),
-                         static_cast<unsigned long long>(readyForPair));
                 }
 
-                // The generated segment is now fully consumed, so REAL(current)
-                // is the final boundary of this pair.
+                // Only after the GEN slot for this pair has been consumed (or
+                // explicitly discarded) may the right-hand REAL frame appear.
                 postCurrentReal();
                 continue;
             }
@@ -2423,9 +2408,13 @@ void workerThread() {
             // arrived while presentContext/AI ran, invalidate this output and
             // keep the newer REAL frame as the visible state.
             const uint64_t generationFrameId = pendingFrame.frameId;
+            // Presentation order is authoritative here. Once this REAL has
+            // been dequeued, its GEN belongs to this pair even if newer
+            // captures arrived while the GPU/AI work was running. Newer
+            // captures stay queued and are presented only after this pair
+            // (REAL -> GEN -> REAL) is complete.
             const bool generationStillValid =
                 generationFrameId != 0 &&
-                generationFrameId == g.latestFrameId.load(std::memory_order_acquire) &&
                 !g.bypass.load(std::memory_order_relaxed) &&
                 !g.stopRequested;
 
