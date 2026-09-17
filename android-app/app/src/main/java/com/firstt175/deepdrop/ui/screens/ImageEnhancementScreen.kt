@@ -1,0 +1,321 @@
+package com.firstt175.deepdrop.ui.screens
+
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.rememberTransformableState
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.transformable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AspectRatio
+import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.RestartAlt
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.unit.dp
+import androidx.navigation.NavHostController
+import com.firstt175.deepdrop.prefs.AntiAliasMode
+import com.firstt175.deepdrop.prefs.LsfgPreferences
+import com.firstt175.deepdrop.prefs.PresentMode
+import com.firstt175.deepdrop.prefs.UpscaleFilter
+import com.firstt175.deepdrop.session.NativeBridge
+import com.firstt175.deepdrop.ui.components.IconBadge
+import com.firstt175.deepdrop.ui.components.LsfgCard
+import com.firstt175.deepdrop.ui.components.LsfgTopBar
+import com.firstt175.deepdrop.ui.components.SectionHeader
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
+@Composable
+fun ImageEnhancementScreen(nav: NavHostController) {
+    val ctx = androidx.compose.ui.platform.LocalContext.current
+    val prefs = remember { LsfgPreferences(ctx) }
+    val initial = remember { prefs.load() }
+
+    var enabled by remember { mutableStateOf(initial.imageEnhancementEnabled) }
+    var contrast by remember { mutableFloatStateOf(initial.imageEnhancementContrast) }
+    var saturation by remember { mutableFloatStateOf(initial.imageEnhancementSaturation) }
+    var upscaleEnabled by remember { mutableStateOf(initial.upscaleEnabled) }
+    var upscaleFilter by remember { mutableStateOf(initial.upscaleFilter) }
+    var antiAliasMode by remember { mutableStateOf(initial.antiAliasMode) }
+    var renderResolution by remember { mutableFloatStateOf(initial.renderResolutionScale) }
+    var preview by remember {
+        mutableStateOf(requireNotNull(BitmapFactory.decodeStream(ctx.assets.open("image/1.png"))))
+    }
+    val source = remember {
+        // Keep one clean source bitmap. Native processing always works on a fresh copy,
+        // preventing slider changes from accumulating rounding errors.
+        requireNotNull(BitmapFactory.decodeStream(ctx.assets.open("image/1.png")))
+    }
+
+    fun saveLive() {
+        prefs.setImageEnhancementEnabled(enabled)
+        prefs.setImageEnhancementContrast(contrast)
+        prefs.setImageEnhancementSaturation(saturation)
+        prefs.setUpscaleEnabled(upscaleEnabled)
+        prefs.setUpscaleFilter(upscaleFilter)
+        prefs.setAntiAliasMode(antiAliasMode)
+        prefs.setRenderResolutionScale(renderResolution)
+        runCatching {
+            NativeBridge.setImageEnhancement(enabled, 1, contrast, saturation)
+            NativeBridge.setUpscaleEnabled(upscaleEnabled)
+            NativeBridge.setUpscaleFilter(upscaleFilter.ordinal)
+            NativeBridge.setAntiAliasMode(antiAliasMode.ordinal)
+        }
+    }
+
+    LaunchedEffect(enabled, contrast, saturation, upscaleEnabled, upscaleFilter, antiAliasMode, renderResolution) {
+        saveLive()
+        val result = withContext(Dispatchers.Default) {
+            val copy = source.copy(Bitmap.Config.ARGB_8888, true)
+            val ok = runCatching {
+                NativeBridge.processImageEnhancementPreview(
+                    copy,
+                    enabled,
+                    1,
+                    contrast,
+                    saturation,
+                    upscaleEnabled,
+                    upscaleFilter.ordinal,
+                    renderResolution,
+                    antiAliasMode.ordinal,
+                )
+            }.getOrDefault(false)
+            if (ok) copy else source.copy(Bitmap.Config.ARGB_8888, true)
+        }
+        preview = result
+    }
+
+    var zoom by remember { mutableFloatStateOf(1f) }
+    var panX by remember { mutableFloatStateOf(0f) }
+    var panY by remember { mutableFloatStateOf(0f) }
+    val transformState = rememberTransformableState { zoomChange, panChange, _ ->
+        zoom = (zoom * zoomChange).coerceIn(1f, 6f)
+        panX += panChange.x
+        panY += panChange.y
+    }
+
+    Column(
+        modifier = Modifier.fillMaxSize().statusBarsPadding()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 20.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        LsfgTopBar(title = "Image Enhancement", onBack = { nav.popBackStack() })
+
+        LsfgCard {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                IconBadge(icon = Icons.Filled.AutoAwesome, size = 36.dp)
+                Spacer(Modifier.size(12.dp))
+                Column {
+                    Text("LIVE RENDER-LOOP PREVIEW", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "Preview uses the native render-loop image settings. There is no Compose color-filter calculation.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+            Spacer(Modifier.height(12.dp))
+
+            Box(
+                modifier = Modifier.fillMaxWidth().height(280.dp)
+                    .background(Color.Black)
+                    .clipToBounds()
+                    .transformable(transformState)
+                    .pointerInput(Unit) {
+                        // Double tap is intentionally kept simple: reset the zoom/pan state.
+                        detectTapGestures(onDoubleTap = {
+                            zoom = 1f
+                            panX = 0f
+                            panY = 0f
+                        })
+                    },
+                contentAlignment = Alignment.Center,
+            ) {
+                androidx.compose.foundation.Image(
+                    bitmap = preview.asImageBitmap(),
+                    contentDescription = "Image enhancement preview",
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier.fillMaxSize().graphicsLayer {
+                        scaleX = zoom
+                        scaleY = zoom
+                        translationX = panX
+                        translationY = panY
+                    }
+                )
+                Text(
+                    "Pinch / drag to zoom • double tap to reset",
+                    modifier = Modifier.align(Alignment.BottomCenter).padding(8.dp),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color.White.copy(alpha = 0.75f),
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                if (enabled) "LIVE • GPU / Vulkan • ${upscaleFilter.name}" else "LIVE PREVIEW OFF",
+                style = MaterialTheme.typography.labelMedium,
+                color = if (enabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+
+        LsfgCard {
+            SectionHeader(eyebrow = "IMAGE ENHANCEMENT / POST PROCESS", title = null)
+            FilterChip(
+                selected = enabled,
+                onClick = { enabled = !enabled },
+                label = { Text(if (enabled) "Enabled" else "Disabled") },
+                leadingIcon = { IconBadge(icon = Icons.Filled.AutoAwesome, size = 20.dp) }
+            )
+            Spacer(Modifier.height(10.dp))
+            Text("Processing backend  •  GPU / Vulkan", style = MaterialTheme.typography.bodyMedium)
+            Text("Contrast  ${"%.2f".format(contrast)}×", style = MaterialTheme.typography.bodyMedium)
+            Slider(value = contrast, onValueChange = { contrast = it }, valueRange = 0.5f..1.5f)
+            Text("Saturation  ${"%.2f".format(saturation)}×", style = MaterialTheme.typography.bodyMedium)
+            Slider(value = saturation, onValueChange = { saturation = it }, valueRange = 0f..2f)
+        }
+
+        LsfgCard {
+            SectionHeader(eyebrow = "UPSCALE", title = null)
+            FilterChip(
+                selected = upscaleEnabled,
+                onClick = { upscaleEnabled = !upscaleEnabled },
+                label = { Text(if (upscaleEnabled) "Upscale Enabled" else "Upscale Disabled") },
+            )
+            Spacer(Modifier.height(8.dp))
+            Text("Scaling filter", style = MaterialTheme.typography.titleSmall)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                FilterChip(
+                    selected = upscaleFilter == UpscaleFilter.NEAREST,
+                    onClick = { upscaleFilter = UpscaleFilter.NEAREST },
+                    label = { Text("Nearest") }, modifier = Modifier.weight(1f)
+                )
+                FilterChip(
+                    selected = upscaleFilter == UpscaleFilter.BILINEAR,
+                    onClick = { upscaleFilter = UpscaleFilter.BILINEAR },
+                    label = { Text("Bilinear") }, modifier = Modifier.weight(1f)
+                )
+            }
+            Text(
+                if (upscaleEnabled) "The selected filter is used by the render-loop presentation path when render resolution is below display resolution."
+                else "Upscale customization is off; presentation falls back to the cheapest nearest filter.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        LsfgCard {
+            SectionHeader(eyebrow = "ANTI-ALIASING", title = null)
+            Text("Edge smoothing", style = MaterialTheme.typography.titleSmall)
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                FilterChip(
+                    selected = antiAliasMode == AntiAliasMode.OFF,
+                    onClick = { antiAliasMode = AntiAliasMode.OFF },
+                    label = { Text("Off") }, modifier = Modifier.weight(1f)
+                )
+                FilterChip(
+                    selected = antiAliasMode == AntiAliasMode.FXAA,
+                    onClick = { antiAliasMode = AntiAliasMode.FXAA },
+                    label = { Text("FXAA") }, modifier = Modifier.weight(1f)
+                )
+                FilterChip(
+                    selected = antiAliasMode == AntiAliasMode.SMAA,
+                    onClick = { antiAliasMode = AntiAliasMode.SMAA },
+                    label = { Text("SMAA") }, modifier = Modifier.weight(1f)
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                when (antiAliasMode) {
+                    AntiAliasMode.OFF -> "No edge smoothing. Sharpest, cheapest, most jagged edges."
+                    AntiAliasMode.FXAA -> "Fast luma-based edge smoothing on the GPU compute pass. Lowest cost, slight softening on edges."
+                    AntiAliasMode.SMAA -> "Wider edge-aware smoothing pass. A bit softer/more GPU cost than FXAA; approximates SMAA-style edge coverage on a single compute pass rather than the full multi-pass SMAA algorithm."
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+
+        LsfgCard {
+            SectionHeader(eyebrow = "RENDER / OVERLAY SETTINGS", title = null)
+            Text("Render resolution  ${(renderResolution * 100f).toInt()}%", style = MaterialTheme.typography.bodyMedium)
+            Slider(
+                value = renderResolution,
+                onValueChange = { renderResolution = it },
+                valueRange = 0.1f..1f,
+                steps = 17,
+            )
+            Text(
+                "This is the same render-resolution control used by SettingsDrawerOverlay. Lower values reduce the captured/rendered buffer before it is presented back at display size.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(8.dp))
+            Text("Frame generation", style = MaterialTheme.typography.titleSmall)
+            Text("Multiplier: ${initial.multiplier}×    Flow scale: ${"%.2f".format(initial.flowScale)}", style = MaterialTheme.typography.bodySmall)
+            Text("Performance: ${if (initial.performanceMode) "On" else "Off"}    HDR: ${if (initial.hdrMode) "On" else "Off"}", style = MaterialTheme.typography.bodySmall)
+            Text("FP16 shaders: ${if (initial.framegenFp16) "On" else "Off"}", style = MaterialTheme.typography.bodySmall)
+            Spacer(Modifier.height(8.dp))
+            Text("Frame scheduling", style = MaterialTheme.typography.titleSmall)
+            Text("Wait for busy generation: ${if (initial.waitForBusyGeneration) "On" else "Off"}", style = MaterialTheme.typography.bodySmall)
+            Text("Allow generation while busy: ${if (initial.allowGenerationWhenBusy) "On" else "Off"}", style = MaterialTheme.typography.bodySmall)
+            Text("Lossless queue: ${if (initial.losslessQueue) "On" else "Off"}", style = MaterialTheme.typography.bodySmall)
+            Spacer(Modifier.height(8.dp))
+            Text("HUD / overlay", style = MaterialTheme.typography.titleSmall)
+            Text("FPS counter: ${if (initial.fpsCounterEnabled) "On" else "Off"} • Frame graph: ${if (initial.frameGraphEnabled) "On" else "Off"}", style = MaterialTheme.typography.bodySmall)
+            Text("CPU: ${if (initial.cpuStatEnabled) "On" else "Off"} • GPU: ${if (initial.gpuStatEnabled) "On" else "Off"} • RAM: ${if (initial.ramStatEnabled) "On" else "Off"}", style = MaterialTheme.typography.bodySmall)
+            Text("Drawer edge: ${initial.drawerEdge.name}", style = MaterialTheme.typography.bodySmall)
+            Text("Present mode: ${initial.presentMode.name}", style = MaterialTheme.typography.bodySmall)
+            Text("Anti-aliasing: ${initial.antiAliasMode.name}", style = MaterialTheme.typography.bodySmall)
+        }
+
+        LsfgCard {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(Icons.Filled.AspectRatio, contentDescription = null)
+                Spacer(Modifier.size(8.dp))
+                Column(Modifier.weight(1f)) {
+                    Text("Preview controls", style = MaterialTheme.typography.titleSmall)
+                    Text("Zoom is view-only and does not affect the render-loop settings.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                FilterChip(
+                    selected = false,
+                    onClick = { zoom = 1f; panX = 0f; panY = 0f },
+                    label = { Text("Reset") },
+                    leadingIcon = { Icon(Icons.Filled.RestartAlt, contentDescription = null) },
+                )
+            }
+        }
+    }
+}
